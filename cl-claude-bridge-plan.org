@@ -1,0 +1,412 @@
+#+TITLE: agent-shell-context-sources 実装計画
+#+DATE: 2026-07-31
+#+OPTIONS: toc:3 ^:nil
+#+FILETAGS: :実装計画:Emacs:CommonLisp:
+
+* アーキテクチャ概要
+
+** 全体像
+
+SLIME（Common Lisp）と Claude Code（agent-shell 経由）を双方向に連携させるグルーコード。
+設計の核は「変更ソースをプラグイン化して1つの変更キューに集約し、agent-shell のプロンプト送信直前にコンテキストとして注入する」構造。
+
+#+begin_example
+                    ┌─────────────────────────────────────────┐
+変更ソース           │      agent-shell-context-sources.el      │
+                    └─────────────────────────────────────────┘
+  slime-eval ──────►┐
+  elisp-eval ──────►│  変更キュー ──► agent-shell-context-sources
+  file-watcher ────►│               （プロンプト送信直前に注入）
+  (future: sly)    ─┘
+                    ↑
+             agent-shell の file-write イベントは除外
+             （pending-self-writes で自己書き込みを把握）
+
+  ┌──────────────────────────────────────────────────────────┐
+  │ 3方向の連携（agent-shell-slime.el コア）                   │
+  │                                                          │
+  │ ① C-c C-c (slime-compile-defun)                          │
+  │      └─► CL image（SLIME 本来の動作）                     │
+  │      └─► cl-mcp HTTP エンドポイント（repl-eval ツール）    │
+  │                                                          │
+  │ ② Claude がファイル保存                                   │
+  │      └─► after-save-hook + SLIME 接続中なら               │
+  │          slime-compile-and-load-file 自動実行             │
+  │                                                          │
+  │ ③ M-x agent-shell-slime-ask (C-c C-')                    │
+  │      └─► カーソル下の defun を取得                        │
+  │      └─► agent-shell--insert-to-shell-buffer に送信       │
+  │          （fallback: kill-ring へコピー）                  │
+  └──────────────────────────────────────────────────────────┘
+#+end_example
+
+** ファイル構成
+
+| ファイル | 内容 | 場所 |
+|----------+------+------|
+| =agent-shell-context-sources.el= | 変更キュー + file-watcher + elisp-eval + context injection（汎用） | agent-shell リポジトリ（PR 対象） |
+| =agent-shell-slime.el=（仮称） | SLIME/CL 特化部分（方向①②③、MCP ツール登録） | 同リポジトリまたは別 package |
+
+=agent-shell-context-sources.el= は既存の =agent-shell-context-sources= defcustom 変数名と
+一致しており、「コンテキストソースの拡張モジュール」として名前が体を表している。
+
+関数プレフィックス：
+- 公開 API :: =agent-shell-context-sources-=
+- 内部関数 :: =agent-shell-context-sources--=
+
+初期 PR は汎用部分（変更キュー + file-watcher）に絞り、SLIME 特化部分は
+=agent-shell-slime.el= に分離する。
+
+-----
+
+* 実装フェーズ
+
+** フェーズ 1: agent-shell-slime.el コア（3方向）
+
+最小構成。~60行規模。cl-mcp と SLIME に直接依存。
+
+*** 方向①：ユーザー編集 → CL image & Claude context
+
+=slime-compile-defun=（=C-c C-c=）に =advice-add= でフックを追加する。
+SLIME 本来の挙動（CL image への送信）はそのまま維持し、追加で
+cl-mcp の HTTP エンドポイントに非同期 POST する。
+
+#+begin_src emacs-lisp
+(defvar agent-shell-slime-cl-mcp-port 3000
+  "cl-mcp HTTP サーバーのポート番号。")
+
+(defun agent-shell-slime--send-to-cl-mcp (form)
+  "FORM を cl-mcp の repl-eval ツールへ非同期 POST する。"
+  (let ((url (format "http://127.0.0.1:%d/mcp" agent-shell-slime-cl-mcp-port))
+        (payload (json-encode
+                  `((:jsonrpc . "2.0")
+                    (:method . "tools/call")
+                    (:id . 1)
+                    (:params . ((:name . "repl-eval")
+                                (:arguments . ((:code . ,form)))))))))
+    (let ((url-request-method "POST")
+          (url-request-extra-headers '(("Content-Type" . "application/json")))
+          (url-request-data payload))
+      (url-retrieve url #'ignore nil t))))
+
+(defun agent-shell-slime--after-compile-defun (&rest _)
+  "slime-compile-defun 後に同じフォームを Claude コンテキストへ送る。"
+  (when-let* ((form (thing-at-point 'defun t)))
+    (agent-shell-slime--send-to-cl-mcp form)))
+
+(advice-add 'slime-compile-defun :after #'agent-shell-slime--after-compile-defun)
+#+end_src
+
+*** 方向②：Claude 編集 → CL image（自動ロード）
+
+=after-save-hook= に追加。lisp-mode バッファかつ SLIME 接続中のときのみ発火。
+
+#+begin_src emacs-lisp
+(defun agent-shell-slime--auto-load-on-save ()
+  "Claude がファイルを保存したとき、CL image に自動ロードする。"
+  (when-let* (((derived-mode-p 'lisp-mode))
+              ((slime-connected-p))
+              (file (buffer-file-name)))
+    (slime-compile-and-load-file)))
+
+(add-hook 'after-save-hook #'agent-shell-slime--auto-load-on-save)
+#+end_src
+
+*** 方向③：エディタ → Claude への指示（agent-shell-slime-ask）
+
+カーソル下の defun を agent-shell のシェルバッファに送信する。
+
+#+begin_src emacs-lisp
+(defvar agent-shell-slime-shell-buffer nil
+  "連携先の agent-shell バッファ。nil の場合は kill-ring にフォールバック。")
+
+(defun agent-shell-slime-ask ()
+  "カーソル下の defun を Claude に送信する（C-c C-'）。"
+  (interactive)
+  (when-let* ((form (thing-at-point 'defun t)))
+    (if (and agent-shell-slime-shell-buffer
+             (buffer-live-p agent-shell-slime-shell-buffer))
+        (agent-shell--insert-to-shell-buffer
+         :text (format "次の Common Lisp フォームを確認・改善してください:\n\n```lisp\n%s\n```" form)
+         :buffer agent-shell-slime-shell-buffer)
+      (kill-new form)
+      (message "agent-shell バッファ未設定。フォームを kill-ring にコピーしました。"))))
+#+end_src
+
+*** claude-code-ide.el 経由の MCP ツール登録（オプション）
+
+=claude-code-ide.el= が利用可能な場合、Claude 側から CL を eval できる
+ツールを2つ登録する。
+
+| ツール名 | 動作 |
+|----------+------|
+| =slime_eval_form= | 任意の CL form を SLIME 経由で eval |
+| =slime_load_current_file= | 現在の .lisp バッファを compile & load |
+
+#+begin_src emacs-lisp
+(with-eval-after-load 'claude-code-ide
+  (claude-code-ide-make-tool
+   "slime_eval_form"
+   "Common Lisp フォームを SLIME 経由で評価する"
+   '(("form" "string" "評価する CL フォーム文字列"))
+   (lambda (args)
+     (slime-eval `(swank:eval-and-grab-output ,(map-elt args "form")))))
+
+  (claude-code-ide-make-tool
+   "slime_load_current_file"
+   "現在の .lisp バッファをコンパイルして CL image にロードする"
+   '()
+   (lambda (_args)
+     (slime-compile-and-load-file))))
+#+end_src
+
+-----
+
+** フェーズ 2: agent-shell-context-sources.el（変更キュー + プラグインアーキテクチャ）
+
+フェーズ1の「方向①」を拡張し、複数の変更ソースを統一的に扱う構造にする。
+=agent-shell-context-sources= にキュードレイン関数を登録することで、
+プロンプト送信直前に蓄積された変更をコンテキストとして注入する。
+
+*** 変更キュー（統一インターフェース）
+
+#+begin_src emacs-lisp
+(defvar agent-shell-context-sources--change-queue nil
+  "変更通知のキュー。各要素は (:source :content :timestamp) のalist。")
+
+(defun agent-shell-context-sources--queue-push (source content)
+  "SOURCE（シンボル）と CONTENT（文字列）をキューに追加する。"
+  (push `((:source . ,source)
+          (:content . ,content)
+          (:timestamp . ,(current-time)))
+        agent-shell-context-sources--change-queue))
+
+(defun agent-shell-context-sources--queue-drain ()
+  "キューの中身を返し、キューをクリアする。"
+  (prog1 (nreverse agent-shell-context-sources--change-queue)
+    (setq agent-shell-context-sources--change-queue nil)))
+#+end_src
+
+*** agent-shell-context-sources への登録
+
+#+begin_src emacs-lisp
+(defun agent-shell-context-sources--from-queue ()
+  "変更キューの中身をコンテキスト文字列として返す。空なら nil。"
+  (when-let* ((changes (agent-shell-context-sources--queue-drain)))
+    (mapconcat
+     (lambda (change)
+       (format "[%s]\n%s"
+               (map-elt change :source)
+               (map-elt change :content)))
+     changes
+     "\n\n")))
+
+(defun agent-shell-context-sources-enable ()
+  "変更キューを agent-shell のコンテキストソースとして登録する。"
+  (add-to-list 'agent-shell-context-sources
+               #'agent-shell-context-sources--from-queue))
+#+end_src
+
+*** 変更ソース実装
+
+**** file-watcher ソース（汎用・優先度高）
+
+auto-revert-mode の =after-revert-hook= をフックし、バッファがリバートされた
+瞬間（外部プロセスによる変更）に変更キューへ push する。
+
+agent-shell 自身の書き込みは =agent-shell-context-sources--pending-self-writes= で除外する。
+
+#+begin_src emacs-lisp
+(defvar agent-shell-context-sources--pending-self-writes
+  (make-hash-table :test 'equal)
+  "agent-shell が書き込み中のファイルパスを記録するテーブル。")
+
+(defun agent-shell-context-sources--on-file-revert ()
+  "after-revert-hook: 外部変更をキューに追加する（自己書き込みは除外）。"
+  (when-let* ((path (buffer-file-name))
+              ((not (gethash path agent-shell-context-sources--pending-self-writes))))
+    (agent-shell-context-sources--queue-push
+     'file-watcher
+     (format "ファイル外部変更: %s\n%s" path (buffer-string)))))
+
+(add-hook 'after-revert-hook #'agent-shell-context-sources--on-file-revert)
+#+end_src
+
+agent-shell の =file-write= イベントで自己書き込みの記録・解除を行う：
+
+#+begin_src emacs-lisp
+(defun agent-shell-context-sources-setup-self-write-tracking (shell-buffer)
+  "SHELL-BUFFER の file-write イベントで自己書き込みを追跡する。"
+  (agent-shell-subscribe-to
+   :shell-buffer shell-buffer
+   :event 'file-write
+   :on-event (lambda (event)
+               (when-let* ((data (map-elt event :data))
+                           (path (map-elt data :path)))
+                 (puthash path t agent-shell-context-sources--pending-self-writes)
+                 (run-with-timer 0.5 nil
+                                 (lambda ()
+                                   (remhash path agent-shell-context-sources--pending-self-writes)))))))
+#+end_src
+
+**** mtime 比較方式（未開バッファ補完）
+
+auto-revert はバッファを開いていないと拾えない。
+agent-shell が =fs/read_text_file= で読んだファイルは mtime を記録し、
+次回チェック時に比較することで未開バッファの変更も検知する。
+
+#+begin_src emacs-lisp
+(defvar agent-shell-context-sources--file-read-log
+  (make-hash-table :test 'equal)
+  "エージェントが読んだファイルの mtime 記録テーブル。
+key: ファイルパス, value: 読んだ時点の mtime。")
+
+(defun agent-shell-context-sources--record-file-read (path)
+  "PATH が読まれた時点の mtime を記録する。"
+  (when-let* ((attrs (file-attributes path)))
+    (puthash path (file-attribute-modification-time attrs)
+             agent-shell-context-sources--file-read-log)))
+
+(defun agent-shell-context-sources--file-changed-since-read-p (path)
+  "PATH が前回読んだ時点から変更されていれば t を返す。"
+  (when-let* ((recorded (gethash path agent-shell-context-sources--file-read-log))
+              (attrs (file-attributes path))
+              (current (file-attribute-modification-time attrs)))
+    (time-less-p recorded current)))
+#+end_src
+
+**** elisp-eval ソース
+
+Emacs Lisp の eval 系コマンドに advice を追加し、実行した form をキューへ push する。
+
+#+begin_src emacs-lisp
+(defun agent-shell-context-sources--after-elisp-eval (&rest _)
+  "Emacs Lisp eval 後に実行したフォームをキューに追加する。"
+  (when-let* ((form (thing-at-point 'sexp t)))
+    (agent-shell-context-sources--queue-push 'elisp-eval form)))
+
+(dolist (cmd '(eval-defun eval-last-sexp eval-region eval-buffer))
+  (advice-add cmd :after #'agent-shell-context-sources--after-elisp-eval))
+#+end_src
+
+**** slime-eval ソース（agent-shell-slime.el から呼び出し）
+
+方向①の拡張版。=slime-compile-defun= だけでなく eval 系全般をキューへ push する。
+=agent-shell-context-sources--queue-push= を直接呼ぶことで2ファイルを接続する。
+
+#+begin_src emacs-lisp
+;; agent-shell-slime.el 内に記述
+(defun agent-shell-slime--after-slime-eval (&rest _)
+  "SLIME eval 後に実行したフォームを変更キューに追加する。"
+  (when-let* ((form (thing-at-point 'defun t)))
+    (agent-shell-context-sources--queue-push 'slime-eval form)))
+
+(dolist (cmd '(slime-compile-defun slime-eval-last-expression slime-eval-defun))
+  (advice-add cmd :after #'agent-shell-slime--after-slime-eval))
+#+end_src
+
+-----
+
+** フェーズ 3: agent-shell 統合 PR
+
+=agent-shell-context-sources.el= の汎用部分を agent-shell 本体への PR として整理する。
+
+*** PR 候補の範囲
+
+| 含む | 含まない |
+|------+---------|
+| 変更キュー（=agent-shell-context-sources--queue-*=） | SLIME 依存コード |
+| file-watcher ソース | CL/SLIME 特化 MCP ツール |
+| =agent-shell-context-sources= への登録ヘルパー | cl-mcp への POST |
+| mtime 比較による未開バッファ対応 | cl-tron-mcp 差し替え手順 |
+
+*** CONTRIBUTING.org チェックリスト
+
+- [ ] alists + =:kebab-case= キーワードを使っているか
+- [ ] =map.el= / =seq.el= を優先しているか（hashtable は =pending-self-writes= のみ許容）
+- [ ] hook 関数は単一 alist パラメータになっているか
+- [ ] =defcustom= を不必要に追加していないか
+- [ ] =when-let*= で適切にフラット化しているか
+- [ ] =checkdoc= を通過するか
+- [ ] =byte-compile-file= で警告が出ないか
+- [ ] PR は小さく、汎用部分と SLIME 特化部分を分離しているか
+
+-----
+
+* 依存関係・前提条件
+
+| 依存 | バージョン | 用途 |
+|------+-----------+------|
+| agent-shell | 最新 main | 基盤パッケージ（=agent-shell-subscribe-to= 等） |
+| cl-mcp | v2.2.0+ | HTTP transport で SLIME と同居（方向①） |
+| SLIME | 最新 | CL image 連携 |
+| SBCL | 問わず | CL ランタイム |
+| claude-code-ide.el | 最新 | MCP ツール登録（オプション、方向③） |
+
+cl-mcp は HTTP transport（推奨）を使うこと。stdio transport だと SLIME からの
+介入が困難になる（=cl-claude-bridge-notes.org= セクション B 参照）。
+
+-----
+
+* 未確認事項（着手前に要確認）
+
+1. =claude-code-ide-send-input= の正確な関数名（バージョンにより変化の可能性）
+2. cl-mcp v2.2.0 の =repl-eval= ツールの JSON-RPC ペイロードスキーマ
+   → =docs/tools.md=（cl-mcp リポジトリ）で確認
+3. cl-tron-mcp に差し替える場合のツール名（=repl_eval= にアンダースコア変化の可能性）
+4. agent-shell の =agent-shell-context-sources= が関数を受け付ける動作が
+   現行 main ブランチで安定しているか（=defcustom= の型確認）
+
+-----
+
+* テスト方針
+
+** 配置場所
+
+=tests/agent-shell-context-sources-tests.el=（agent-shell 既存のテストパターンに合わせる）
+
+** テスト項目
+
+| テスト | 手法 |
+|--------+------|
+| キューへの push / drain | ERT + =should= |
+| 自己書き込みの除外 | =pending-self-writes= を手動セット後、=after-revert-hook= を呼ぶ |
+| mtime 比較の正確さ | =make-temp-file= で一時ファイル作成後、mtime を意図的に変更 |
+| =after-elisp-eval= advice | =thing-at-point= をモック |
+| =agent-shell-slime--send-to-cl-mcp= | =url-retrieve= をモックして POST ペイロードを検証 |
+
+** 手動検証手順
+
+1. SBCL を起動し、=cl-mcp:start-http-server :port 3000= で HTTP サーバーを起動
+2. Emacs で SLIME 接続（=M-x slime=）
+3. .lisp バッファで任意の defun を書き、=C-c C-c= を実行
+4. cl-mcp のログで =repl-eval= ツール呼び出しが届いていることを確認
+5. agent-shell で次のプロンプトを送信し、変更キューのコンテキストが注入されることを確認
+
+-----
+
+* 着手タイミングと優先順位
+
+=cl-claude-bridge-notes.org= セクション C「着手タイミングの方針」より：
+
+- Flutter アプリ v1.0 リリースを優先。このプロジェクトは週次余剰利用枠で進める
+- 先を越されるリスクは SLIME/CL 特化部分はほぼゼロ、汎用部分は数ヶ月スケール
+- 着手週ごとのマイルストーン：
+  1. file-watcher ソース実装（=agent-shell-context-sources.el= 汎用部分、=auto-revert= + mtime 比較）
+  2. elisp-eval ソース実装
+  3. slime-eval ソース実装（=agent-shell-slime.el=、個人の趣味枠）
+  4. agent-shell PR（=agent-shell-context-sources.el= 汎用部分のみ、フェーズ3）
+  5. Sly 対応・shell-command-wrapper（将来の拡張候補）
+
+- 着手前に必ず agent-shell の最新ソース・CHANGELOG を確認し、
+  =agent-shell-subscribe-to= 周りの API が変わっていないか検証すること
+
+-----
+
+* 関連リソース
+
+- [[file:cl-claude-bridge-notes.org][cl-claude-bridge-notes.org]] — 調査・設計メモ（本計画の元資料）
+- [[https://github.com/xenodium/agent-shell][xenodium/agent-shell]] — agent-shell 本体
+- [[https://github.com/cl-ai-project/cl-mcp][cl-ai-project/cl-mcp]] — cl-mcp（HTTP transport 推奨）
+- [[https://github.com/Alba-Intelligence/cl-tron-mcp][Alba-Intelligence/cl-tron-mcp]] — cl-tron-mcp（デバッガ操作が必要な場合）
+- [[https://github.com/manzaltu/claude-code-ide.el][manzaltu/claude-code-ide.el]] — MCP ツール登録に使用（オプション）
