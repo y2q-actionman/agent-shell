@@ -1,0 +1,136 @@
+* Notify the agent when a known file changes outside its control
+
+** Context
+
+When a file the agent already knows about (has read or written during this
+session) is changed *outside the agent's own action* -- e.g. the user edits
+and saves it directly in Emacs -- the agent currently has no way to find
+out, short of re-reading that exact file again on its own initiative. It
+can end up acting on stale assumptions about that file's content.
+
+This is the opposite of an earlier direction that was considered and
+rejected: having Emacs buffers auto-revert from the agent's own disk
+changes. That's largely covered already: ~fs/write_text_file~ syncs the
+buffer in place (~agent-shell--on-fs-write-text-file-request~,
+agent-shell.el:3217), and ~fs/read_text_file~ checks
+~verify-visited-file-modtime~ before returning content
+(~agent-shell--extract-buffer-text~, agent-shell.el:3123). The residual gap
+there wasn't worth the added machinery (file-notify/polling or a globalized
+minor mode reaching every Emacs buffer).
+
+ACP has no generic "client tells agent an arbitrary thing happened
+mid-turn" notification -- only request/response for ~fs/read_text_file~,
+~fs/write_text_file~, ~session/request_permission~, plus a narrow
+~session/cancel~ notification (see ~acp-send-notification~ usage at
+agent-shell.el:1898). So "telling the agent" has to happen through the one
+channel that's actually conversational: sending it a prompt. agent-shell
+already has infrastructure for that -- the prompt queue
+(=agent-shell-prompt-queue.el=): ~agent-shell--prompt-queue-enqueue~
+(line 162) appends to =:pending-prompts= when the shell is busy, and
+~agent-shell-prompt-queue~ (line 196) sends immediately via
+~agent-shell--insert-to-shell-buffer~ when idle.
+
+Scope:
+- Only notify about files the agent already knows about this session (has
+  called ~fs/read_text_file~ or ~fs/write_text_file~ on) -- not every file
+  under the session's ~agent-shell-cwd~. Keeps notifications meaningful
+  instead of noisy.
+- Detection is via Emacs's ~after-save-hook~ (the user editing and saving
+  the file directly in Emacs). A single global hook function, not a
+  globalized minor mode and not file-notify/polling -- much lighter weight,
+  and sufficient for the main case (the user editing a file the agent is
+  also working with). Changes made by some other, fully external process
+  (not going through an Emacs save) are out of scope for this pass.
+
+** Approach
+
+*** 1. Track "known files" per session
+
+Add =:known-files= to ~agent-shell--make-state~ (agent-shell.el:1013,
+initialized to nil). Add a helper:
+
+#+begin_src emacs-lisp
+  (cl-defun agent-shell--track-known-file (&key state path)
+    "Record PATH as known to the agent in STATE, if not already tracked.")
+#+end_src
+
+Call it (with the already-resolved absolute =path=) from:
+- ~agent-shell--on-fs-read-text-file-request~ (agent-shell.el:3148, after
+  =path= is resolved at line 3151).
+- ~agent-shell--on-fs-write-text-file-request~ (agent-shell.el:3217, after
+  =path= is resolved at line 3220).
+
+*** 2. Suppress notification for the agent's own writes
+
+~agent-shell--on-fs-write-text-file-request~ itself calls
+~basic-save-buffer~ (agent-shell.el:3243), which would otherwise trigger
+the new ~after-save-hook~ function for the agent's own write -- that's not
+an "external" change and must not be echoed back to the agent. Let-bind a
+dynamic variable (~agent-shell--suppress-save-notification~) to =t= around
+that ~basic-save-buffer~ call; the hook function checks and skips when it's
+set.
+
+*** 3. Global after-save-hook function
+
+#+begin_src emacs-lisp
+  (defun agent-shell--notify-known-file-changed ()
+    "...")
+  (add-hook 'after-save-hook #'agent-shell--notify-known-file-changed)
+#+end_src
+
+Runs in the context of the saved buffer (per ~after-save-hook~ semantics):
+- Skip when ~agent-shell--suppress-save-notification~ is bound and non-nil.
+- Skip when =buffer-file-name= is nil.
+- For each live shell buffer from ~(agent-shell-buffers)~
+  (agent-shell.el:1569): check whether the saved file's resolved absolute
+  path is a member of that buffer's ~agent-shell--state~ =:known-files=. If
+  so, notify that session (a file could plausibly be known to more than one
+  open session; notify all matches).
+
+*** 4. Deliver the note
+
+For a matching session's shell buffer, reuse the same busy/idle branching
+~agent-shell-prompt-queue~ already uses (agent-shell-prompt-queue.el:196):
+
+#+begin_src emacs-lisp
+  (with-current-buffer shell-buffer
+    (if (shell-maker-busy)
+        (agent-shell--prompt-queue-enqueue :prompt note)
+      (agent-shell--insert-to-shell-buffer :text note :submit t :no-focus t)))
+#+end_src
+
+where =note= is something like:
+
+#+begin_src emacs-lisp
+  (format "Note: %s was modified outside of this session." relative-path)
+#+end_src
+
+(relative to that session's ~agent-shell-cwd~, matching how other
+user-facing paths are shown elsewhere in the codebase).
+
+** Files to change
+
+- =agent-shell.el=
+  - =:known-files= field in ~agent-shell--make-state~ (~line 1013).
+  - ~agent-shell--track-known-file~ helper, called from the two =fs/*=
+    handlers (~lines 3148-3260).
+  - ~agent-shell--suppress-save-notification~ defvar + let-binding around
+    ~basic-save-buffer~ in ~agent-shell--on-fs-write-text-file-request~
+    (~line 3243).
+  - ~agent-shell--notify-known-file-changed~ + the ~add-hook~ call for
+    ~after-save-hook~ (new, near the other =fs/*= handlers).
+- =tests/agent-shell-tests.el=
+  - A test where the agent reads a file (=fs/read_text_file=), the test
+    then saves that buffer (simulating the user editing it), and asserts a
+    prompt-queue/insert call happens with a note mentioning the file.
+  - A test where a file is saved that the agent never read/wrote -> no
+    notification.
+  - A test that the agent's own =fs/write_text_file= save does not
+    self-notify.
+
+** Verification
+
+- ~M-x checkdoc~ and ~M-x byte-compile-file~ on =agent-shell.el= (per
+  CONTRIBUTING.org).
+- ~M-x agent-shell-run-all-tests~ (or ~ert~ on the new tests specifically)
+  after opening a file under =tests/=.
