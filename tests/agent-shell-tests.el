@@ -4705,5 +4705,105 @@ prompt and the prompt end sits past the accessible `point-max'."
           ;; Must not raise `Args out of range' and must report not-live.
           (should-not (agent-shell--live-input-prompt-p prompt)))))))
 
+(ert-deftest agent-shell--track-known-file-test ()
+  "Tracks a path once, without duplicating repeat calls."
+  (let ((state (list (cons :known-files nil))))
+    (agent-shell--track-known-file :state state :path "/tmp/foo.el")
+    (agent-shell--track-known-file :state state :path "/tmp/foo.el")
+    (should (equal '("/tmp/foo.el") (map-elt state :known-files)))))
+
+(ert-deftest agent-shell--notify-known-file-changed-known-file-test ()
+  "Notifies a session that already knows about the saved file."
+  (let ((edited-buffer (generate-new-buffer " *known-file-edit-test*"))
+        (shell-buffer (generate-new-buffer " *known-file-shell-test*"))
+        (calls nil))
+    (unwind-protect
+        (progn
+          (with-current-buffer shell-buffer
+            (setq-local agent-shell--state (list (cons :known-files '("/tmp/foo.el")))))
+          (cl-letf (((symbol-function 'agent-shell-buffers) (lambda () (list shell-buffer)))
+                    ((symbol-function 'agent-shell--notify-file-changed)
+                     (lambda (&rest args) (push args calls))))
+            (with-current-buffer edited-buffer
+              (setq buffer-file-name "/tmp/foo.el")
+              (let ((agent-shell--suppress-save-notification nil))
+                (agent-shell--notify-known-file-changed))))
+          (should (equal (list (list :shell-buffer shell-buffer :path "/tmp/foo.el")) calls)))
+      (kill-buffer edited-buffer)
+      (kill-buffer shell-buffer))))
+
+(ert-deftest agent-shell--notify-known-file-changed-unknown-file-test ()
+  "Does not notify a session that never saw the saved file."
+  (let ((edited-buffer (generate-new-buffer " *unknown-file-edit-test*"))
+        (shell-buffer (generate-new-buffer " *unknown-file-shell-test*"))
+        (calls nil))
+    (unwind-protect
+        (progn
+          (with-current-buffer shell-buffer
+            (setq-local agent-shell--state (list (cons :known-files '("/tmp/other.el")))))
+          (cl-letf (((symbol-function 'agent-shell-buffers) (lambda () (list shell-buffer)))
+                    ((symbol-function 'agent-shell--notify-file-changed)
+                     (lambda (&rest args) (push args calls))))
+            (with-current-buffer edited-buffer
+              (setq buffer-file-name "/tmp/foo.el")
+              (let ((agent-shell--suppress-save-notification nil))
+                (agent-shell--notify-known-file-changed))))
+          (should-not calls))
+      (kill-buffer edited-buffer)
+      (kill-buffer shell-buffer))))
+
+(ert-deftest agent-shell--notify-known-file-changed-suppressed-test ()
+  "Does not notify for agent-shell's own write to a known file."
+  (let ((edited-buffer (generate-new-buffer " *suppressed-file-edit-test*"))
+        (shell-buffer (generate-new-buffer " *suppressed-file-shell-test*"))
+        (calls nil))
+    (unwind-protect
+        (progn
+          (with-current-buffer shell-buffer
+            (setq-local agent-shell--state (list (cons :known-files '("/tmp/foo.el")))))
+          (cl-letf (((symbol-function 'agent-shell-buffers) (lambda () (list shell-buffer)))
+                    ((symbol-function 'agent-shell--notify-file-changed)
+                     (lambda (&rest args) (push args calls))))
+            (with-current-buffer edited-buffer
+              (setq buffer-file-name "/tmp/foo.el")
+              (let ((agent-shell--suppress-save-notification t))
+                (agent-shell--notify-known-file-changed))))
+          (should-not calls))
+      (kill-buffer edited-buffer)
+      (kill-buffer shell-buffer))))
+
+(ert-deftest agent-shell--notify-file-changed-idle-sends-immediately-test ()
+  "Sends the note immediately when the shell isn't busy."
+  (let ((shell-buffer (generate-new-buffer " *notify-file-changed-idle-test*"))
+        (sent nil))
+    (unwind-protect
+        (cl-letf (((symbol-function 'agent-shell-cwd) (lambda () "/tmp/proj/"))
+                  ((symbol-function 'shell-maker-busy) (lambda () nil))
+                  ((symbol-function 'agent-shell--insert-to-shell-buffer)
+                   (lambda (&rest args) (push args sent)))
+                  ((symbol-function 'agent-shell--prompt-queue-enqueue)
+                   (lambda (&rest _) (error "Should not enqueue when idle"))))
+          (agent-shell--notify-file-changed :shell-buffer shell-buffer :path "/tmp/proj/foo.el")
+          (should (equal (list (list :text "Note: foo.el was modified outside of this session."
+                                     :submit t :no-focus t))
+                         sent)))
+      (kill-buffer shell-buffer))))
+
+(ert-deftest agent-shell--notify-file-changed-busy-enqueues-test ()
+  "Queues the note instead of sending it when the shell is busy."
+  (let ((shell-buffer (generate-new-buffer " *notify-file-changed-busy-test*"))
+        (queued nil))
+    (unwind-protect
+        (cl-letf (((symbol-function 'agent-shell-cwd) (lambda () "/tmp/proj/"))
+                  ((symbol-function 'shell-maker-busy) (lambda () t))
+                  ((symbol-function 'agent-shell--prompt-queue-enqueue)
+                   (lambda (&rest args) (push args queued)))
+                  ((symbol-function 'agent-shell--insert-to-shell-buffer)
+                   (lambda (&rest _) (error "Should not insert when busy"))))
+          (agent-shell--notify-file-changed :shell-buffer shell-buffer :path "/tmp/proj/foo.el")
+          (should (equal (list (list :prompt "Note: foo.el was modified outside of this session."))
+                         queued)))
+      (kill-buffer shell-buffer))))
+
 (provide 'agent-shell-tests)
 ;;; agent-shell-tests.el ends here

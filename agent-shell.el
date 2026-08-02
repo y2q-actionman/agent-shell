@@ -1044,6 +1044,7 @@ OUTGOING-REQUEST-DECORATOR (passed through to `acp-make-client')."
         (cons :request-count 0)
         (cons :last-activity-time nil)
         (cons :tool-calls nil)
+        (cons :known-files nil)
         (cons :available-commands nil)
         (cons :available-modes nil)
         (cons :supports-session-list nil)
@@ -3145,6 +3146,19 @@ If the buffer's file has changed, prompt the user to reload it."
             (goto-char (point-max)))
           (buffer-substring-no-properties start (point)))))))
 
+(cl-defun agent-shell--track-known-file (&key state path)
+  "Record PATH as known to the agent in STATE.
+
+PATH is expected to already be resolved to an absolute path.  No-op when
+PATH is already tracked.
+
+For example:
+
+  (agent-shell--track-known-file :state state :path \"/tmp/foo.el\")
+  (map-elt state :known-files) ;; => (\"/tmp/foo.el\")"
+  (unless (member path (map-elt state :known-files))
+    (map-put! state :known-files (cons path (map-elt state :known-files)))))
+
 (cl-defun agent-shell--on-fs-read-text-file-request (&key state acp-request)
   "Handle fs/read_text_file ACP-REQUEST with STATE."
   (condition-case err
@@ -3159,6 +3173,7 @@ If the buffer's file has changed, prompt the user to reload it."
                         (with-temp-buffer
                           (insert-file-contents path)
                           (agent-shell--extract-buffer-text :buffer (current-buffer) :line line :limit limit)))))
+        (agent-shell--track-known-file :state state :path path)
         (acp-send-response
          :client (map-elt state :client)
          :response (acp-make-fs-read-text-file-response
@@ -3214,6 +3229,14 @@ function before returning."
       (dolist (mode disabled)
         (funcall mode 1)))))
 
+(defvar agent-shell--suppress-save-notification nil
+  "Non-nil while agent-shell is saving a buffer on the agent's behalf.
+
+Bound around `basic-save-buffer' in
+`agent-shell--on-fs-write-text-file-request' so
+`agent-shell--notify-known-file-changed' can tell the agent's own writes
+apart from the user externally editing and saving a known file.")
+
 (cl-defun agent-shell--on-fs-write-text-file-request (&key state acp-request)
   "Handle fs/write_text_file ACP-REQUEST with STATE."
   (condition-case err
@@ -3240,7 +3263,9 @@ function before returning."
                  agent-shell-write-inhibit-minor-modes
                  (lambda ()
                    (replace-buffer-contents content-buffer 1.0)))
-                (basic-save-buffer)))))
+                (let ((agent-shell--suppress-save-notification t))
+                  (basic-save-buffer))))))
+        (agent-shell--track-known-file :state state :path path)
         (agent-shell--emit-event
          :event 'file-write
          :data (list (cons :path path)
@@ -3266,6 +3291,38 @@ function before returning."
                  :error (acp-make-error
                          :code -32603
                          :message (error-message-string err)))))))
+
+(cl-defun agent-shell--notify-file-changed (&key shell-buffer path)
+  "Tell the agent in SHELL-BUFFER that PATH changed outside of its control.
+
+Queues the note when the shell is busy, or sends it immediately otherwise,
+mirroring `agent-shell-prompt-queue'."
+  (with-current-buffer shell-buffer
+    (let ((note (format "Note: %s was modified outside of this session."
+                        (file-relative-name path (agent-shell-cwd)))))
+      (if (shell-maker-busy)
+          (agent-shell--prompt-queue-enqueue :prompt note)
+        (agent-shell--insert-to-shell-buffer :text note :submit t :no-focus t)))))
+
+(defun agent-shell--notify-known-file-changed ()
+  "Notify agent-shell sessions a known file changed outside their control.
+
+Runs on `after-save-hook'.  For every live shell buffer
+\(`agent-shell-buffers') that already knows about the saved file (tracked
+via `agent-shell--track-known-file' when the agent reads or writes it),
+send a note so the agent doesn't keep acting on stale content.
+
+Skipped for saves agent-shell itself performs on the agent's behalf; see
+`agent-shell--suppress-save-notification'."
+  (when (and buffer-file-name
+             (not agent-shell--suppress-save-notification))
+    (let ((path (expand-file-name buffer-file-name)))
+      (dolist (shell-buffer (agent-shell-buffers))
+        (when (member path (map-elt (buffer-local-value 'agent-shell--state shell-buffer)
+                                    :known-files))
+          (agent-shell--notify-file-changed :shell-buffer shell-buffer :path path))))))
+
+(add-hook 'after-save-hook #'agent-shell--notify-known-file-changed)
 
 (defun agent-shell--resolve-path (path)
   "Resolve PATH using `agent-shell-path-resolver-function'."
