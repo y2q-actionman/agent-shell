@@ -36,11 +36,27 @@ Scope:
   under the session's ~agent-shell-cwd~. Keeps notifications meaningful
   instead of noisy.
 - Detection is via Emacs's ~after-save-hook~ (the user editing and saving
-  the file directly in Emacs). A single global hook function, not a
-  globalized minor mode and not file-notify/polling -- much lighter weight,
-  and sufficient for the main case (the user editing a file the agent is
-  also working with). Changes made by some other, fully external process
-  (not going through an Emacs save) are out of scope for this pass.
+  the file directly in Emacs). Not a globalized minor mode
+  (~define-globalized-minor-mode~, the ~global-auto-revert-mode~ pattern)
+  and not file-notify/polling -- much lighter weight, and sufficient for
+  the main case (the user editing a file the agent is also working with).
+  Changes made by some other, fully external process (not going through an
+  Emacs save) are out of scope for this pass.
+
+** Amendment: toggle via a =:global t= minor mode
+
+The hook is wired up through
+~agent-shell-notify-known-file-changes-mode~, a plain
+~define-minor-mode~ with =:global t= (the ~save-place-mode~ /
+~winner-mode~ shape -- a single on/off switch, no per-buffer state), not
+a bare unconditional ~add-hook~ at load time. This still isn't the
+~define-globalized-minor-mode~ pattern rejected above (that machinery
+turns a *buffer-local* mode on in every buffer; this feature has no
+per-buffer state to toggle). It just gives users a documented,
+discoverable way to turn the behavior off
+(~M-x agent-shell-notify-known-file-changes-mode~) instead of requiring
+manual ~remove-hook~. Enabled by default, matching the original always-on
+behavior.
 
 ** Approach
 

@@ -3322,7 +3322,22 @@ Skipped for saves agent-shell itself performs on the agent's behalf; see
                                     :known-files))
           (agent-shell--notify-file-changed :shell-buffer shell-buffer :path path))))))
 
-(add-hook 'after-save-hook #'agent-shell--notify-known-file-changed)
+(define-minor-mode agent-shell-notify-known-file-changes-mode
+  "Toggle notifying agents when a known file changes outside their session.
+
+When enabled (the default), saving a file in Emacs that some agent-shell
+session already knows about (has read or written this session) queues a
+note to that session via `agent-shell--notify-known-file-changed', so the
+agent doesn't keep acting on stale content.
+
+This is a global mode: there's no per-buffer state, it just adds or
+removes `agent-shell--notify-known-file-changed' on `after-save-hook'."
+  :global t
+  (if agent-shell-notify-known-file-changes-mode
+      (add-hook 'after-save-hook #'agent-shell--notify-known-file-changed)
+    (remove-hook 'after-save-hook #'agent-shell--notify-known-file-changed)))
+
+(agent-shell-notify-known-file-changes-mode 1)
 
 (defun agent-shell--resolve-path (path)
   "Resolve PATH using `agent-shell-path-resolver-function'."

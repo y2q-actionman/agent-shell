@@ -4805,5 +4805,17 @@ prompt and the prompt end sits past the accessible `point-max'."
                          queued)))
       (kill-buffer shell-buffer))))
 
+(ert-deftest agent-shell-notify-known-file-changes-mode-toggle-test ()
+  "Toggling the mode adds/removes the after-save-hook function."
+  (unwind-protect
+      (progn
+        (agent-shell-notify-known-file-changes-mode -1)
+        (should-not (memq 'agent-shell--notify-known-file-changed
+                          (default-value 'after-save-hook)))
+        (agent-shell-notify-known-file-changes-mode 1)
+        (should (memq 'agent-shell--notify-known-file-changed
+                      (default-value 'after-save-hook))))
+    (agent-shell-notify-known-file-changes-mode 1)))
+
 (provide 'agent-shell-tests)
 ;;; agent-shell-tests.el ends here
