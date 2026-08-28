@@ -189,6 +189,9 @@ cl-mcp の HTTP エンドポイントに非同期 POST する。
 
 *** agent-shell-context-sources への登録
 
+=agent-shell--context=（agent-shell.el:9548）は =seq-some= で動作し、最初に非nilを返したソースで打ち止めになる。
+キュー関数はリストの*先頭*に置くことで「eval 内容が非空のときは最優先コンテキストとして使い、空なら通常の files/region 等に委ねる」挙動を得る。
+
 #+begin_src emacs-lisp
 (defun agent-shell-context-sources--from-queue ()
   "変更キューの中身をコンテキスト文字列として返す。空なら nil。"
@@ -202,9 +205,12 @@ cl-mcp の HTTP エンドポイントに非同期 POST する。
      "\n\n")))
 
 (defun agent-shell-context-sources-enable ()
-  "変更キューを agent-shell のコンテキストソースとして登録する。"
-  (add-to-list 'agent-shell-context-sources
-               #'agent-shell-context-sources--from-queue))
+  "変更キューを agent-shell のコンテキストソースとして登録する。
+
+リスト先頭に push することで、キューに内容があるときは最優先コンテキストとなり、
+空のときは後続の files/region/error/line ソースに委ねる。"
+  (push #'agent-shell-context-sources--from-queue
+        agent-shell-context-sources))
 #+end_src
 
 *** 変更ソース実装
