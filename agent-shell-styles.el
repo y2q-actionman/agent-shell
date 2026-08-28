@@ -32,13 +32,13 @@
 (require 'seq)
 (require 'agent-shell-faces)
 
-(declare-function agent-shell--add-text-properties "agent-shell")
+(declare-function agent-shell--add-text-properties "agent-shell-ui")
 
 (defun agent-shell--short-kind-label (kind)
   "Return a short label for tool call KIND string."
   (pcase kind
     ("search" "find")
-    ("execute" "run")
+    ("execute" "command")
     (_ kind)))
 
 (defun agent-shell--status-config (status)
@@ -47,14 +47,14 @@
   (agent-shell--status-config \"completed\")
   ;; => ((:label . \"done\") (:icon . \"✓\") (:face . agent-shell-success))"
   (pcase status
-    ("pending" '((:label . "wait") (:icon . "…") (:face . agent-shell-pending)))
-    ("in_progress" '((:label . "busy") (:icon . "…") (:face . agent-shell-warning)))
+    ("pending" '((:label . "wait") (:icon . "◔") (:face . agent-shell-pending)))
+    ("in_progress" '((:label . "busy") (:icon . "◔") (:face . agent-shell-warning)))
     ("completed" '((:label . "done") (:icon . "✓") (:face . agent-shell-success)))
     ("failed" '((:label . "error") (:icon . "✗") (:face . agent-shell-error)))
     (_ '((:label . "unknown") (:icon . "?") (:face . agent-shell-warning)))))
 
 (defun agent-shell--inverse-label-status-kind-label (status kind)
-  "Render STATUS as an inverse-video word label and KIND as boxed text.
+  "Render STATUS as an inverse video word label and KIND as boxed text.
 
 Uses the word label from `agent-shell--status-config' (e.g. \"done\")
 with `(:inverse-video t)' so the text sits on a face-colored
@@ -143,6 +143,39 @@ Returns a propertized string or nil."
         (concat status-text " " kind-text)
       (or status-text kind-text))))
 
+(defun agent-shell--icon-and-kind-status-kind-label (status kind)
+  "Render STATUS as a colored icon followed by KIND as a heading.
+
+KIND is capitalized and shares `agent-shell-section-heading' with the
+\"Thinking\" label and the activity group header, so every entry in a
+group reads at the same weight, with the title beside it plain.  Nothing
+is padded: fragments sit a blank line apart, so a fixed kind column buys
+no scanning and only opens a gap.  Entries carrying no KIND, like plan
+steps, render the icon alone.
+
+  (agent-shell--icon-and-kind-status-kind-label \"completed\" \"execute\")
+  ;; => \"✓ Command\"
+
+  (agent-shell--icon-and-kind-status-kind-label \"pending\" nil)
+  ;; => \"◔\"
+
+STATUS is a string like \"completed\" or nil.
+KIND is a string like \"read\" or nil.
+Returns a propertized string or nil."
+  (let* ((status-config (agent-shell--status-config status))
+         (status-text (when status
+                        (propertize (map-elt status-config :icon)
+                                    'font-lock-face (map-elt status-config :face))))
+         (kind-text (when kind
+                      (propertize (capitalize
+                                   (string-replace
+                                    "_" " "
+                                    (agent-shell--short-kind-label kind)))
+                                  'font-lock-face 'agent-shell-section-heading))))
+    (if (and status-text kind-text)
+        (concat status-text " " kind-text)
+      (or status-text kind-text))))
+
 (defun agent-shell--plain-colored-status-kind-label (status kind)
   "Render STATUS and KIND as plain colored text with no decoration.
 
@@ -166,7 +199,7 @@ Returns a propertized string or nil."
     (concat status-text kind-text)))
 
 (defun agent-shell--inverse-icon-status-kind-label (status kind)
-  "Render STATUS as an inverse-video icon glyph and KIND as boxed text.
+  "Render STATUS as an inverse video icon glyph and KIND as boxed text.
 
 Uses the unicode glyph from `agent-shell--status-config' with
 `(:inverse-video t)' so the glyph sits on a face-colored rectangle.

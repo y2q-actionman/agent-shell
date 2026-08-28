@@ -185,6 +185,41 @@ fall back to searching the new-side text.  Mirrors the real Claude Code
             (when (find-buffer-visiting file) (kill-buffer (find-buffer-visiting file)))))
       (delete-file file))))
 
+(ert-deftest agent-shell-diff-open-file-drops-stale-region-test ()
+  "Test that jumping into a file drops a region left active in it.
+
+A range reference elsewhere (`file:2-4\=', say) leaves its lines
+selected, and this jump moves point out from under that selection, so
+what it would otherwise span afterwards is neither the range nor the
+change."
+  (let ((file (make-temp-file "agent-shell-jump" nil ".txt"
+                              "alpha\nbeta\ngamma\ndelta\n")))
+    (unwind-protect
+        (let ((buf (agent-shell-diff
+                    :diffs (list (list (cons :old "gamma")
+                                       (cons :new "gamma CHANGED")
+                                       (cons :file file))))))
+          (unwind-protect
+              (progn
+                (with-current-buffer (find-file-noselect file)
+                  (goto-char (point-min))
+                  (push-mark (line-end-position 2) t t)
+                  ;; `mark-active' rather than `region-active-p': the latter
+                  ;; is nil whenever `transient-mark-mode' is off (as under
+                  ;; batch), passing whether or not the mark was cleared.
+                  (should mark-active))
+                (with-current-buffer buf
+                  (goto-char (point-min))
+                  (search-forward "-gamma")
+                  (beginning-of-line)
+                  (agent-shell-diff-open-file))
+                (with-current-buffer (find-buffer-visiting file)
+                  (should (equal (line-number-at-pos) 3))
+                  (should-not mark-active)))
+            (when (buffer-live-p buf) (kill-buffer buf))
+            (when (find-buffer-visiting file) (kill-buffer (find-buffer-visiting file)))))
+      (delete-file file))))
+
 (ert-deftest agent-shell-diff-open-file-disambiguates-with-hint-test ()
   "Test that the ACP `locations' line picks between duplicate matches.
 
@@ -208,6 +243,43 @@ land on the first.  The hint line steers it to the intended occurrence."
                 (agent-shell-diff-open-file)
                 ;; Second "target" is at line 5, not the first at line 2.
                 (should (equal (line-number-at-pos) 5)))
+            (when (buffer-live-p buf) (kill-buffer buf))
+            (when (find-buffer-visiting file) (kill-buffer (find-buffer-visiting file)))))
+      (delete-file file))))
+
+(ert-deftest agent-shell-diff-open-file-navigates-later-hunk-test ()
+  "Test that open-file resolves a change in a later hunk.
+
+With more than one hunk, blank spacer lines surround each `changes'
+label (the one below it is tagged `agent-shell-diff-spacer').  The jump
+must skip that spacer and still land on the changed line of the hunk at
+point."
+  (let* ((old (string-join
+               '("alpha" "one" "two" "three" "four" "five" "six" "seven"
+                 "OLD_A" "eight" "nine" "ten" "eleven" "twelve" "thirteen"
+                 "fourteen" "OLD_B" "omega")
+               "\n"))
+         (new (string-join
+               '("alpha" "one" "two" "three" "four" "five" "six" "seven"
+                 "NEW_A" "eight" "nine" "ten" "eleven" "twelve" "thirteen"
+                 "fourteen" "NEW_B" "omega")
+               "\n"))
+         (file (make-temp-file "agent-shell-jump" nil ".txt" (concat old "\n"))))
+    (unwind-protect
+        (let ((buf (agent-shell-diff
+                    :diffs (list (list (cons :old old)
+                                       (cons :new new)
+                                       (cons :file file))))))
+          (unwind-protect
+              (with-current-buffer buf
+                ;; Two changes far enough apart to form separate hunks.
+                (goto-char (point-min))
+                (search-forward "-OLD_B")
+                (beginning-of-line)
+                (agent-shell-diff-open-file)
+                (should (equal (buffer-substring-no-properties
+                                (line-beginning-position) (line-end-position))
+                               "OLD_B")))
             (when (buffer-live-p buf) (kill-buffer buf))
             (when (find-buffer-visiting file) (kill-buffer (find-buffer-visiting file)))))
       (delete-file file))))
